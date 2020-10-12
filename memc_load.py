@@ -1,18 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os
-import gzip
-import sys
-import glob
-import logging
 import collections
+import glob
+import gzip
+import logging
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, wait
 from optparse import OptionParser
+from queue import Queue
+from threading import Lock
+
+# pip install python-memcached
+import memcache
+
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
 import appsinstalled_pb2
-# pip install python-memcached
-import memcache
 
 NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
@@ -24,29 +29,31 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
+def insert_apps_installed(memc_addr, queue, errors, lock, dry_run=False):
     ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
+    memc_client = memcache.Client([memc_addr])
+    while True:
+        apps_installed = queue.get()
+        if not apps_installed:
+            return
+        ua.lat = apps_installed.lat
+        ua.lon = apps_installed.lon
+        key = "%s:%s" % (apps_installed.dev_type, apps_installed.dev_id)
+        ua.apps.extend(apps_installed.apps)
+        packed = ua.SerializeToString()
+        try:
+            if dry_run:
+                logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+            else:
+                memc_client.set(key, packed)
+        except Exception as e:
+            logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+            with lock:
+                errors += 1
 
 
-def parse_appsinstalled(line):
-    line_parts = line.strip().split("\t")
+def parse_apps_installed(line):
+    line_parts = line.decode().strip().split("\t")
     if len(line_parts) < 5:
         return
     dev_type, dev_id, lat, lon, raw_apps = line_parts
@@ -64,50 +71,60 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
+def process_line(line, device_memc, errors, lock):
+    apps_installed = parse_apps_installed(line)
+    if not apps_installed:
+        with lock:
+            errors += 1
+        return
+    queue = device_memc.get(apps_installed.dev_type)
+    if not queue:
+        logging.error("Unknown device type: %s" % apps_installed.dev_type)
+        with lock:
+            errors += 1
+        return
+    queue.put(apps_installed)
+
+
 def main(options):
-    device_memc = {
-        "idfa": options.idfa,
-        "gaid": options.gaid,
-        "adid": options.adid,
-        "dvid": options.dvid,
-    }
+    devices = ['idfa', 'gaid', 'adid', 'dvid']
     for fn in glob.iglob(options.pattern):
-        processed = errors = 0
+        total = errors = 0
+        pool = ThreadPoolExecutor(len(devices))
+        installers = []
+        device_memc = dict()
+        for device in devices:
+            queue = Queue()
+            device_memc[device] = queue
+            installer = pool.submit(insert_apps_installed, getattr(options, device), queue, errors, Lock(), options.dry)
+            installers.append(installer)
+
         logging.info('Processing %s' % fn)
         fd = gzip.open(fn)
+        parsers = []
         for line in fd:
             line = line.strip()
             if not line:
                 continue
-            appsinstalled = parse_appsinstalled(line)
-            if not appsinstalled:
-                errors += 1
-                continue
-            memc_addr = device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
-                errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
-            if ok:
-                processed += 1
-            else:
-                errors += 1
-        if not processed:
-            fd.close()
-            dot_rename(fn)
-            continue
+            total += 1
+            with ThreadPoolExecutor(max_workers=options.workers) as executor:
+                parsers.append(executor.submit(process_line, line, device_memc, errors, Lock()))
 
-        err_rate = float(errors) / processed
+        wait(parsers)
+        for queue in device_memc.values():
+            queue.put(None)
+        wait(installers)
+
+        err_rate = float(errors) / total
         if err_rate < NORMAL_ERR_RATE:
-            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+            logging.info("Acceptable error rate (%s). Successful load" % err_rate)
         else:
             logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
         fd.close()
         dot_rename(fn)
 
 
-def prototest():
+def proto_test():
     sample = "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
     for line in sample.splitlines():
         dev_type, dev_id, lat, lon, raw_apps = line.strip().split("\t")
@@ -127,6 +144,7 @@ if __name__ == '__main__':
     op = OptionParser()
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
+    op.add_option("-w", "--workers", action="store", default=10)
     op.add_option("--dry", action="store_true", default=False)
     op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
@@ -137,7 +155,7 @@ if __name__ == '__main__':
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
                         format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
-        prototest()
+        proto_test()
         sys.exit(0)
 
     logging.info("Memc loader started with options: %s" % opts)
