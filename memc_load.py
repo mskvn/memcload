@@ -9,7 +9,6 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, wait
 from optparse import OptionParser
 from queue import Queue
-from threading import Lock
 
 # pip install python-memcached
 import memcache
@@ -29,7 +28,7 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_apps_installed(memc_addr, queue, errors, lock, dry_run=False):
+def insert_apps_installed(memc_addr, queue, errors, dry_run=False):
     ua = appsinstalled_pb2.UserApps()
     memc_client = memcache.Client([memc_addr])
     while True:
@@ -48,8 +47,7 @@ def insert_apps_installed(memc_addr, queue, errors, lock, dry_run=False):
                 memc_client.set(key, packed)
         except Exception as e:
             logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-            with lock:
-                errors += 1
+            errors.put(1)
 
 
 def parse_apps_installed(line):
@@ -71,17 +69,16 @@ def parse_apps_installed(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def process_line(line, device_memc, errors, lock):
+def process_line(line, device_memc, errors):
     apps_installed = parse_apps_installed(line)
     if not apps_installed:
-        with lock:
-            errors += 1
+        logging.info('apps_installed is None')
+        errors.put(1)
         return
     queue = device_memc.get(apps_installed.dev_type)
     if not queue:
         logging.error("Unknown device type: %s" % apps_installed.dev_type)
-        with lock:
-            errors += 1
+        errors.put(1)
         return
     queue.put(apps_installed)
 
@@ -89,14 +86,15 @@ def process_line(line, device_memc, errors, lock):
 def main(options):
     devices = ['idfa', 'gaid', 'adid', 'dvid']
     for fn in glob.iglob(options.pattern):
-        total = errors = 0
+        total = 0
+        errors_queue = Queue()
         pool = ThreadPoolExecutor(len(devices))
         installers = []
         device_memc = dict()
         for device in devices:
             queue = Queue()
             device_memc[device] = queue
-            installer = pool.submit(insert_apps_installed, getattr(options, device), queue, errors, Lock(), options.dry)
+            installer = pool.submit(insert_apps_installed, getattr(options, device), queue, errors_queue, options.dry)
             installers.append(installer)
 
         logging.info('Processing %s' % fn)
@@ -107,14 +105,22 @@ def main(options):
             if not line:
                 continue
             total += 1
-            with ThreadPoolExecutor(max_workers=options.workers) as executor:
-                parsers.append(executor.submit(process_line, line, device_memc, errors, Lock()))
+            with ThreadPoolExecutor(max_workers=int(options.workers)) as executor:
+                parsers.append(executor.submit(process_line, line, device_memc, errors_queue))
 
+        logging.info('Wait while all lines parsed')
         wait(parsers)
         for queue in device_memc.values():
             queue.put(None)
+        logging.info('Wait while all apps inserted')
         wait(installers)
 
+        errors = 0
+        while not errors_queue.empty():
+            errors += errors_queue.get()
+
+        logging.info(f'Parsed {total} lines')
+        logging.info(f'Found {errors} errors')
         err_rate = float(errors) / total
         if err_rate < NORMAL_ERR_RATE:
             logging.info("Acceptable error rate (%s). Successful load" % err_rate)
