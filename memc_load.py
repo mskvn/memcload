@@ -88,32 +88,41 @@ def main(options):
     for fn in glob.iglob(options.pattern):
         total = 0
         errors_queue = Queue()
-        pool = ThreadPoolExecutor(len(devices))
-        installers = []
+        inserters = []
+        pool = ThreadPoolExecutor(int(options.workers))
+        inserts_by_device_count = int(int(options.workers) / len(devices))
         device_memc = dict()
         for device in devices:
             queue = Queue()
             device_memc[device] = queue
-            installer = pool.submit(insert_apps_installed, getattr(options, device), queue, errors_queue, options.dry)
-            installers.append(installer)
-
+            for _ in range(inserts_by_device_count):
+                inserters.append(
+                    pool.submit(insert_apps_installed, getattr(options, device), queue, errors_queue, options.dry)
+                )
+        logging.info(f'Max threads for parse lines: {int(options.workers)}')
+        logging.info(f'Threads for inserts app to memcache: {int(options.workers)}')
+        logging.info(f'Threads for inserts app to memcache by devive: {inserts_by_device_count}')
         logging.info('Processing %s' % fn)
         fd = gzip.open(fn)
         parsers = []
+
         for line in fd:
             line = line.strip()
             if not line:
                 continue
             total += 1
+            if total > 1000 and total % 1000 == 0:
+                logging.info(f'Read {total} lines from {fn}')
             with ThreadPoolExecutor(max_workers=int(options.workers)) as executor:
                 parsers.append(executor.submit(process_line, line, device_memc, errors_queue))
 
-        logging.info('Wait while all lines parsed')
+        logging.info(f'Wait while all lines from {fn} parsed')
         wait(parsers)
         for queue in device_memc.values():
-            queue.put(None)
-        logging.info('Wait while all apps inserted')
-        wait(installers)
+            for _ in range(inserts_by_device_count):
+                queue.put(None)
+        logging.info(f'Wait while all apps from {fn} inserted')
+        wait(inserters)
 
         errors = 0
         while not errors_queue.empty():
