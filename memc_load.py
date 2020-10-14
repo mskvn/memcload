@@ -45,8 +45,8 @@ def insert_apps_installed(memc_addr, queue, errors, dry_run=False):
                 logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
             else:
                 memc_client.set(key, packed)
-        except Exception as e:
-            logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+        except Exception as exp:
+            logging.exception("Cannot write to memc %s: %s" % (memc_addr, exp))
             errors.put(1)
 
 
