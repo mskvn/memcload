@@ -31,7 +31,10 @@ def dot_rename(path):
 def insert_apps_installed(memc_addr, queue, errors, dry_run=False):
     ua = appsinstalled_pb2.UserApps()
     memc_client = memcache.Client([memc_addr])
+    count = 0
     while True:
+        if count > 1000 and count % 1000 == 0:
+            logging.info(f'({memc_addr}) Insert {count} apps')
         apps_installed = queue.get()
         if not apps_installed:
             return
@@ -45,6 +48,7 @@ def insert_apps_installed(memc_addr, queue, errors, dry_run=False):
                 logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
             else:
                 memc_client.set(key, packed)
+                count += 1
         except Exception as exp:
             logging.exception("Cannot write to memc %s: %s" % (memc_addr, exp))
             errors.put(1)
